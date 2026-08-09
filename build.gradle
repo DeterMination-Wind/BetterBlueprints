@@ -1,0 +1,208 @@
+plugins{
+    id "java"
+}
+
+def releaseArtifactBaseName = "BetterBlueprints"
+
+group = "betterblueprints"
+version = "0.0.0"
+
+java{
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+def mindustryVersion = (findProperty("mindustryVersion") ?: "v159").toString()
+def localMindustryCoreJar = new File(rootDir.parentFile, "Mindustry-master/core/build/libs/core-release.jar")
+def localMindustryDesktopJar = new File(rootDir.parentFile, "Mindustry-master/desktop/build/libs/Mindustry.jar")
+def localArcCoreJar = new File(rootDir.parentFile, "Arc/arc-core/build/libs/arc-core-1.0.jar")
+
+repositories{
+    mavenCentral()
+    maven{ url "https://jitpack.io" }
+}
+
+dependencies{
+    // Prefer the local v159 core jar so the mod builds against the same checkout used for local testing.
+    if(localMindustryCoreJar.exists()){
+        def localMindustryClasspath = [localMindustryCoreJar]
+        if(localArcCoreJar.exists()){
+            localMindustryClasspath.add(localArcCoreJar)
+        }
+        if(localMindustryDesktopJar.exists()){
+            localMindustryClasspath.add(localMindustryDesktopJar)
+        }
+        compileOnly files(localMindustryClasspath)
+    }else{
+        // jitpack fallback; arc transitive deps excluded (orphan commit), bundled arc used instead.
+        def bundledArcClasspath = [
+            new File(rootDir, "tools/deps/arc-core.jar"),
+            new File(rootDir, "tools/deps/arcnet.jar")
+        ].findAll{ it.exists() }
+        compileOnly("com.github.Anuken.Mindustry:core:$mindustryVersion"){
+            exclude group: "com.github.Anuken.Arc"
+        }
+        compileOnly files(bundledArcClasspath)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach{
+    options.encoding = "UTF-8"
+    // Mindustry v7 mods are Java 8 compatible; D8 converts the classes into Android dex output.
+    if(JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_1_9)){
+        options.release.set(8)
+    }
+}
+
+tasks.withType(Jar).configureEach{
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+jar{
+    archiveFileName = "${releaseArtifactBaseName}.zip"
+    from(sourceSets.main.output)
+    from(projectDir){
+        include "mod.json"
+    }
+}
+
+tasks.register("jarAndroid", Jar){
+    group = "build"
+    description = "Packages BetterBlueprints as a .jar for Mindustry Android (classes.dex)."
+    archiveFileName = "${releaseArtifactBaseName}-android.jar"
+    from(projectDir){
+        include "mod.json"
+    }
+}
+
+def buildOutDir = new File(rootDir.parentFile, "构建/${releaseArtifactBaseName}")
+
+tasks.register("jarLocalDev", Jar){
+    group = "build"
+    description = "Packages the local dev test jar."
+    dependsOn tasks.named("classes")
+    archiveFileName = "${releaseArtifactBaseName}-dev.jar"
+    destinationDirectory.set(buildOutDir)
+    from(sourceSets.main.output)
+    from(projectDir){
+        include "mod.json"
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+def isWindows = System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("windows")
+
+def findD8 = {
+    def explicit = System.getenv("D8_PATH")
+    if(explicit){
+        def f = new File(explicit)
+        if(f.exists()) return f
+    }
+
+    def sdkRoot = System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME")
+    if(sdkRoot){
+        def buildToolsDir = new File(sdkRoot, "build-tools")
+        if(buildToolsDir.isDirectory()){
+            def toolName = isWindows ? "d8.bat" : "d8"
+            def candidates = (buildToolsDir.listFiles() ?: [])
+                .findAll{ it.isDirectory() }
+                .sort{ a, b -> b.name <=> a.name }
+
+            for(def dir : candidates){
+                def exe = new File(dir, toolName)
+                if(exe.exists()) return exe
+            }
+        }
+    }
+
+    if(isWindows){
+        def workspaceRoot = rootDir.parentFile
+        def matches = (workspaceRoot.listFiles() ?: [])
+            .findAll{ it.isDirectory() && it.name.startsWith("commandlinetools-win-") }
+            .sort{ a, b -> b.name <=> a.name }
+
+        for(def dir : matches){
+            def exe = new File(dir, "cmdline-tools/bin/d8.bat")
+            if(exe.exists()) return exe
+        }
+    }
+
+    return null
+}
+
+def androidDexOutDir = layout.buildDirectory.dir("d8").get().asFile
+
+tasks.register("d8InputJar", Jar){
+    group = "build"
+    description = "Builds a jar used only as input for D8 (no dist side effects)."
+    dependsOn tasks.named("classes")
+    archiveFileName = "${project.name}-d8-input.jar"
+    destinationDirectory = layout.buildDirectory.dir("d8-input")
+    from(sourceSets.main.output)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.register("dexAndroid", Exec){
+    group = "build"
+    description = "Compiles Java bytecode into classes.dex for Mindustry Android mod loading."
+    dependsOn tasks.named("d8InputJar")
+
+    doFirst{
+        def d8 = findD8()
+        if(d8 == null){
+            throw new GradleException("D8 not found. Set ANDROID_SDK_ROOT/ANDROID_HOME or D8_PATH (or keep commandlinetools-win-* in workspace root on Windows).")
+        }
+        delete(androidDexOutDir)
+        androidDexOutDir.mkdirs()
+
+        def programZip = tasks.named("d8InputJar").get().archiveFile.get().asFile
+
+        commandLine d8.absolutePath
+        args "--min-api", "14", "--release", "--output", androidDexOutDir.absolutePath
+        args programZip.absolutePath
+    }
+}
+
+tasks.named("jarAndroid").configure{
+    dependsOn tasks.named("dexAndroid")
+    from(androidDexOutDir){
+        include "classes.dex"
+    }
+    from(sourceSets.main.output.resourcesDir)
+}
+
+tasks.register("jarMerged", Jar){
+    group = "build"
+    description = "Packages a single jar for both desktop and Android."
+    dependsOn tasks.named("classes")
+    dependsOn tasks.named("dexAndroid")
+    archiveFileName = "${releaseArtifactBaseName}.jar"
+    destinationDirectory = layout.buildDirectory.dir("libs")
+    from(sourceSets.main.output)
+    from(androidDexOutDir){
+        include "classes.dex"
+    }
+    from(projectDir){
+        include "mod.json"
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.register("copyMergedJarToBuildDir", Copy){
+    doNotTrackState("Copies into build output folder for convenience.")
+    dependsOn tasks.named("jarMerged")
+    from(tasks.named("jarMerged").flatMap{ it.archiveFile })
+    into(buildOutDir)
+    rename{ _ -> "${releaseArtifactBaseName}.jar" }
+}
+
+tasks.named("jarMerged").configure{
+    finalizedBy tasks.named("copyMergedJarToBuildDir")
+}
+
+tasks.register("deploy"){
+    group = "build"
+    description = "Builds merged desktop+android jar and the local dev jar."
+    dependsOn tasks.named("jarMerged")
+    dependsOn tasks.named("jarLocalDev")
+}

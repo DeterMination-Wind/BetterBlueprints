@@ -1,0 +1,6 @@
+# Gradle / Java
+build/
+.gradle/
+*.class
+.idea/
+*.iml

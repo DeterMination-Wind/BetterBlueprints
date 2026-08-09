@@ -1,0 +1,11 @@
+{
+  "name": "BetterBlueprints-dev",
+  "displayName": "更好的蓝图",
+  "author": "DeterMination-Wind",
+  "description": "把蓝图浏览器改造成磁贴式浏览：打开先见可配置大小与封面的磁贴，点进去看蓝图；每个蓝图只属于一个磁贴。",
+  "version": "0.0.0",
+  "minGameVersion": 154,
+  "java": true,
+  "main": "betterblueprints.BetterBlueprintsMod",
+  "hidden": false
+}
