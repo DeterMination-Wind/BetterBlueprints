@@ -13,6 +13,7 @@ import arc.scene.*;
 import arc.scene.event.*;
 import arc.scene.style.*;
 import arc.scene.ui.*;
+import arc.scene.ui.Button.*;
 import arc.scene.ui.ImageButton.*;
 import arc.scene.ui.TextButton.*;
 import arc.scene.ui.layout.*;
@@ -45,6 +46,14 @@ import static mindustry.Vars.*;
  * touching the typed {@code Vars.ui.schematics} field. The mod classloader breaks package-private
  * overrides, so the vanilla visibility listeners are removed and the whole layout is rebuilt by
  * {@link #rebuild()} from our own shown/resized handlers instead.</p>
+ *
+ * <p>The tile grid follows the launcher-widget model (Android widget / Win10 start screen): every
+ * tile — including the fixed "All" / "Uncategorized" / "+" tiles — is an entity on one virtual
+ * grid with its own cell size ({@code w x h}) and cell position ({@code gx, gy}). Tiles can be
+ * dragged freely to any cell; while dragging, the target cell is marked with a white outline and
+ * the grid itself stays read-only. On drop the target is resolved once: overlapped tiles are
+ * chain-pushed along the drag direction (fallback: down, then append below everything), so no
+ * overlap ever remains and every tile stays visible. Positions are persisted per tile.</p>
  */
 public class BetterSchematicsDialog extends SchematicsDialog{
     /** Size of one grid cell in px (vanilla blueprint card size). */
@@ -55,6 +64,8 @@ public class BetterSchematicsDialog extends SchematicsDialog{
     private static final float cell = unit + gap;
     /** Pointer travel required (px) before a tile drag starts. */
     private static final float dragThreshold = 24f;
+    /** Safety cap for the drag target row (the grid may grow below its content, but not unboundedly). */
+    private static final int maxRows = 64;
     private static final Pattern ignoreSymbols = Pattern.compile("[`~!@#$%^&*()\\-_=+{}|;:'\",<.>/?]");
 
     public static final String TILE_ALL = "<all>";
@@ -78,31 +89,36 @@ public class BetterSchematicsDialog extends SchematicsDialog{
     private float dragDirX, dragDirY;
     private float dragStartX, dragStartY;
     private TileEntry dragTile;
+    private String dragFixedId;
     private Table floatingTile;
+    /** Target-cell indicator (white outline) shown while dragging (child of gridTable). */
+    private Table dragGhost;
     private ScrollPane tilePane;
     private Table gridTable;
+    /** Scroll offset to apply after the next grid rebuild (post-drop scroll into view). */
+    private float pendingScrollY = -1;
+    private boolean widthInitialized;
+    private int builtCols;
+    private boolean buildingGrid;
     private final Vec2 tmp = new Vec2();
-    /** Simulated grid positions of every tile during a drag (drag preview / tile shoving). */
-    private final ObjectMap<TileEntry, int[]> dragPreview = new ObjectMap<>();
-    /** Placeholder entries for the fixed tiles so drag logic treats them like any tile. */
+    /** Placeholder entries backing the fixed tiles so drag logic treats them like any tile. */
     private final TileEntry fixedAll = new TileEntry();
     private final TileEntry fixedUncat = new TileEntry();
     private final TileEntry fixedNew = new TileEntry();
 
-    /** One entry of the tile grid: a fixed tile, a user tile or the empty drag placeholder. */
-    static class GridSlot{
-        final TileEntry tile;
-        final String fixed;
-        final int w, h;
-        final boolean placeholder;
-        int gx, gy;
+    /** One grid entity: a user tile or a fixed built-in tile, with its resolved cell. */
+    static class TileEnt{
+        final TileEntry source;
+        final String fixedId;
+        int gx, gy, w, h;
 
-        GridSlot(TileEntry tile, String fixed, int w, int h, boolean placeholder){
-            this.tile = tile;
-            this.fixed = fixed;
+        TileEnt(TileEntry source, String fixedId, int gx, int gy, int w, int h){
+            this.source = source;
+            this.fixedId = fixedId;
+            this.gx = gx;
+            this.gy = gy;
             this.w = w;
             this.h = h;
-            this.placeholder = placeholder;
         }
     }
 
@@ -145,6 +161,14 @@ public class BetterSchematicsDialog extends SchematicsDialog{
                 rebuildView();
             }
         });
+
+        //fixed tiles are full grid entities: constant sizes, persisted positions
+        fixedAll.w = 2;
+        fixedAll.h = 1;
+        fixedUncat.w = 2;
+        fixedUncat.h = 1;
+        fixedNew.w = 1;
+        fixedNew.h = 1;
     }
 
     @Override
@@ -179,6 +203,7 @@ public class BetterSchematicsDialog extends SchematicsDialog{
     }
 
     void rebuild(){
+        cancelDrag();
         try{
             store.ensureLoaded();
             if(store.consumeMigratedFlag()){
@@ -212,6 +237,7 @@ public class BetterSchematicsDialog extends SchematicsDialog{
     }
 
     void rebuildView(){
+        if(dragActive) return; //the grid is read-only while a drag is in progress
         view.clearChildren();
         view.top();
         if(currentTile == null){
@@ -299,11 +325,14 @@ public class BetterSchematicsDialog extends SchematicsDialog{
     //region tile grid
 
     int cols(){
-        //skyline columns: 1 cell = one 200px column; tiles may span several columns
-        return Math.max((int)(Core.graphics.getWidth() / Scl.scl(unit)), 1);
+        //columns come from the pane's real width once laid out; fall back to the screen width
+        //on the very first pass (before the first layout) so auto-placement still works
+        float avail = (tilePane != null && tilePane.getWidth() > 0) ? tilePane.getWidth() : Core.graphics.getWidth();
+        return Math.max(1, (int)(avail / Scl.scl(unit)));
     }
 
     void buildTileGrid(Table root){
+        widthInitialized = false;
         Cell<ScrollPane> cell = root.pane(p -> {
             p.top().left();
             gridTable = new Table();
@@ -312,149 +341,115 @@ public class BetterSchematicsDialog extends SchematicsDialog{
             buildGrid();
         }).grow().scrollX(false);
         tilePane = cell.get();
+        tilePane.update(() -> {
+            //apply the post-drop scroll once this pane has a real size
+            if(pendingScrollY >= 0 && tilePane.getHeight() > 0){
+                float maxScroll = Math.max(0, gridTable.getHeight() - tilePane.getHeight());
+                tilePane.setScrollY(Math.min(pendingScrollY, maxScroll));
+                pendingScrollY = -1;
+            }
+            //the first layout reveals the pane's real width: rebuild once so the column count
+            //and auto-placement match what is actually visible (only when the width is sane)
+            if(!widthInitialized && tilePane.getWidth() >= Scl.scl(unit) * 2f){
+                widthInitialized = true;
+                if(cols() != builtCols){
+                    buildGrid();
+                }
+            }
+        });
     }
 
     /**
-     * Virtual-grid placement: every slot is drawn at its own grid cell position
-     * ({@code gx * cell, gy * cell}); tiles keep their positions when dragged elsewhere and may
-     * leave empty cells between them. Returns each slot's pixel rect (top-left origin, y grows
-     * downward). Shared by the real grid build and the drag simulation.
+     * Builds the grid entities in display order: fixed "All" tile, user tiles, fixed
+     * "Uncategorized" tile, fixed "+" tile. Auto-assigns and repairs cells first (see
+     * {@link #materializePositions()}).
      */
-    static void simulateLayout(Seq<GridSlot> slots, int cols, Seq<Rect> out){
-        int n = slots.size;
-        while(out.size < n) out.add(new Rect());
-
-        for(int i = 0; i < n; i++){
-            GridSlot s = slots.get(i);
-            Rect r = out.get(i);
-            r.set(s.gx * cell, s.gy * cell, s.w * cell - gap, s.h * cell - gap);
-        }
-        out.size = n;
-    }
-
-    /** Grid slots in display order: fixed tiles at their stored cells, user tiles at theirs. */
-    Seq<GridSlot> buildSlots(Seq<TileEntry> users){
+    Seq<TileEnt> buildEntities(){
         materializePositions();
-        Seq<GridSlot> slots = new Seq<>();
-        slots.add(fixedSlot(TILE_ALL, fixedAll, 2, 1));
-        for(TileEntry t : users){
-            slots.add(tileSlot(t, dragPreview.get(t)));
+        Seq<TileEnt> out = new Seq<>();
+        out.add(new TileEnt(fixedAll, TILE_ALL, store.data.allGx, store.data.allGy, 2, 1));
+        for(TileEntry t : store.data.tiles){
+            out.add(new TileEnt(t, null, t.gx, t.gy, t.w, t.h));
         }
-        slots.add(fixedSlot(TILE_UNCAT, fixedUncat, 2, 1));
-        slots.add(fixedSlot(TILE_NEW, fixedNew, 1, 1));
-        return slots;
-    }
-
-    GridSlot fixedSlot(String id, TileEntry holder, int w, int h){
-        GridSlot s = new GridSlot(holder, id, w, h, false);
-        int[] p = dragPreview.get(holder);
-        s.gx = p != null ? p[0] : holder.gx;
-        s.gy = p != null ? p[1] : holder.gy;
-        return s;
-    }
-
-    /** User-tile slot at its stored position, or the drag-preview position while dragging. */
-    GridSlot tileSlot(TileEntry t, int[] preview){
-        GridSlot s = new GridSlot(t, null, t.w, t.h, false);
-        s.gx = preview != null ? preview[0] : t.gx;
-        s.gy = preview != null ? preview[1] : t.gy;
-        return s;
-    }
-
-    /** Slots while dragging: the dragged tile is replaced by an empty placeholder at its target cell. */
-    Seq<GridSlot> buildDragSlots(){
-        Seq<GridSlot> slots = buildSlots(store.data.tiles);
-        //the dragged tile itself is floating; draw the placeholder at the target position instead
-        Seq<GridSlot> out = new Seq<>();
-        for(GridSlot s : slots){
-            if(s.tile == dragTile) continue;
-            out.add(s);
-        }
-        GridSlot ph = new GridSlot(null, null, dragTile.w, dragTile.h, true);
-        ph.gx = dragGx;
-        ph.gy = dragGy;
-        out.add(ph);
+        out.add(new TileEnt(fixedUncat, TILE_UNCAT, store.data.uncatGx, store.data.uncatGy, 2, 1));
+        out.add(new TileEnt(fixedNew, TILE_NEW, store.data.newGx, store.data.newGy, 1, 1));
         return out;
     }
 
     /**
-     * Assigns grid cells to tiles that don't have one yet (new tiles / legacy data): in list
-     * order, each tile is placed on the first free cell that fits, scanning row by row. The
-     * fixed tiles get stable auto cells: All = (0,0), Uncategorized and the new-tile button
-     * fill the next free spots. Results are persisted back into the data.
+     * Assigns grid cells to tiles that don't have one yet (new tiles / legacy data) and repairs
+     * any overlap or out-of-bounds cell: in display order, each tile keeps its cell when it is
+     * valid and free, otherwise it is placed on the first free cell that fits (scanning row by
+     * row). Idempotent: once every tile has a valid free cell, nothing moves and nothing is
+     * saved again.
      */
     void materializePositions(){
-        boolean changed = false;
         int ncols = cols();
-
-        //fixed All tile
-        if(store.data.allGx < 0 || store.data.allGy < 0){
-            store.data.allGx = 0;
-            store.data.allGy = 0;
-            changed = true;
+        //an unreliable column count (pane not laid out yet / tiny window) must never re-place
+        //tiles: one wrong pass would shuffle and persist the whole layout
+        if(ncols < 2){
+            Log.info("[BetterBlueprints] materialize skipped: ncols=@", ncols);
+            return;
         }
-        fixedAll.gx = store.data.allGx;
-        fixedAll.gy = store.data.allGy;
-        fixedAll.w = 2;
-        fixedAll.h = 1;
-
-        Seq<TileEntry> placed = new Seq<>();
-        placed.add(fixedAll);
-
+        boolean changed = false;
+        Seq<TileEnt> all = new Seq<>();
+        all.add(new TileEnt(fixedAll, TILE_ALL, store.data.allGx, store.data.allGy, 2, 1));
         for(TileEntry t : store.data.tiles){
-            if(t.gx >= 0 && t.gy >= 0){
-                placed.add(t);
-                continue;
+            all.add(new TileEnt(t, null, t.gx, t.gy, t.w, t.h));
+        }
+        all.add(new TileEnt(fixedUncat, TILE_UNCAT, store.data.uncatGx, store.data.uncatGy, 2, 1));
+        all.add(new TileEnt(fixedNew, TILE_NEW, store.data.newGx, store.data.newGy, 1, 1));
+
+        Seq<TileEnt> placed = new Seq<>();
+        for(TileEnt e : all){
+            boolean needs = e.gx < 0 || e.gy < 0 || e.gx + e.w > ncols || overlapsPlaced(placed, e.gx, e.gy, e.w, e.h);
+            if(needs){
+                int[] cell = firstFree(placed, ncols, e.w, e.h);
+                Log.info("[BetterBlueprints] materialize: '@' (@,@)->(@,@) ncols=@", e.fixedId != null ? e.fixedId : e.source.name, e.gx, e.gy, cell[0], cell[1], ncols);
+                e.gx = cell[0];
+                e.gy = cell[1];
+                writeBack(e);
+                changed = true;
             }
-            int[] cell = firstFree(placed, ncols, t.w, t.h);
-            t.gx = cell[0];
-            t.gy = cell[1];
-            placed.add(t);
-            changed = true;
+            placed.add(e);
         }
-
-        if(store.data.uncatGx < 0 || store.data.uncatGy < 0){
-            int[] cell = firstFree(placed, ncols, 2, 1);
-            store.data.uncatGx = cell[0];
-            store.data.uncatGy = cell[1];
-            changed = true;
-        }
-        fixedUncat.gx = store.data.uncatGx;
-        fixedUncat.gy = store.data.uncatGy;
-        fixedUncat.w = 2;
-        fixedUncat.h = 1;
-        placed.add(fixedUncat);
-
-        if(store.data.newGx < 0 || store.data.newGy < 0){
-            int[] cell = firstFree(placed, ncols, 1, 1);
-            store.data.newGx = cell[0];
-            store.data.newGy = cell[1];
-            changed = true;
-        }
-        fixedNew.gx = store.data.newGx;
-        fixedNew.gy = store.data.newGy;
-        fixedNew.w = 1;
-        fixedNew.h = 1;
-
         if(changed) store.save();
     }
 
-    /** Scans the grid row by row for the first cell where a w x h tile fits without overlapping. */
-    static int[] firstFree(Seq<TileEntry> placed, int ncols, int w, int h){
-        int limit = Math.max(16, placed.size * 4 + 8);
+    /** First cell (row by row) where a w x h tile fits without overlapping any placed tile. */
+    static int[] firstFree(Seq<TileEnt> placed, int ncols, int w, int h){
+        int limit = Math.max(16, placed.size * 8 + 16);
+        int maxX = Math.max(0, ncols - w);
         for(int gy = 0; gy < limit; gy++){
-            for(int gx = 0; gx + w <= ncols; gx++){
-                if(!overlapsAny(placed, gx, gy, w, h)) return new int[]{gx, gy};
+            for(int gx = 0; gx <= maxX; gx++){
+                if(!overlapsPlaced(placed, gx, gy, w, h)) return new int[]{gx, gy};
             }
         }
         return new int[]{0, 0};
     }
 
-    static boolean overlapsAny(Seq<TileEntry> placed, int gx, int gy, int w, int h){
-        for(TileEntry t : placed){
-            if(overlap(gx, gy, w, h, t.gx, t.gy, t.w, t.h)) return true;
+    static boolean overlapsPlaced(Seq<TileEnt> placed, int gx, int gy, int w, int h){
+        for(TileEnt o : placed){
+            if(overlap(gx, gy, w, h, o.gx, o.gy, o.w, o.h)) return true;
         }
         return false;
+    }
+
+    /** Writes an entity's resolved cell back into its persistent storage. */
+    void writeBack(TileEnt e){
+        if(e.fixedId == null){
+            e.source.gx = e.gx;
+            e.source.gy = e.gy;
+        }else if(TILE_ALL.equals(e.fixedId)){
+            store.data.allGx = e.gx;
+            store.data.allGy = e.gy;
+        }else if(TILE_UNCAT.equals(e.fixedId)){
+            store.data.uncatGx = e.gx;
+            store.data.uncatGy = e.gy;
+        }else{
+            store.data.newGx = e.gx;
+            store.data.newGy = e.gy;
+        }
     }
 
     static boolean overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh){
@@ -463,49 +458,42 @@ public class BetterSchematicsDialog extends SchematicsDialog{
 
     /** Rebuilds only the tile grid table (keeps the search row and dialog chrome untouched). */
     void buildGrid(){
-        if(gridTable == null) return;
-        gridTable.clearChildren();
+        if(gridTable == null || buildingGrid) return;
+        buildingGrid = true;
+        try{
+            gridTable.clearChildren();
+            Seq<TileEnt> ents = buildEntities();
+            int ncols = cols();
+            builtCols = ncols;
 
-        Seq<GridSlot> slots = dragActive ? buildDragSlots() : buildSlots(store.data.tiles);
-        Seq<Rect> rects = new Seq<>();
-        simulateLayout(slots, cols(), rects);
-
-        float maxW = 0f, maxH = 0f;
-        for(int i = 0; i < slots.size; i++){
-            GridSlot s = slots.get(i);
-            Rect r = rects.get(i);
-
-            Element e;
-            if(s.placeholder){
-                Table ph = new Table();
-                ph.touchable = Touchable.disabled;
-                e = ph;
-            }else if(s.fixed != null){
-                e = addFixedTile(s.fixed, holderFor(s.fixed), r.width, r.height);
-            }else{
-                e = addUserTile(s.tile, r.width, r.height);
+            //content size first: row gy starts at gy*cell from the content top
+            float maxW = 0f, maxH = 0f;
+            for(TileEnt e : ents){
+                maxW = Math.max(maxW, e.gx * cell + e.w * cell - gap);
+                maxH = Math.max(maxH, e.gy * cell + e.h * cell - gap);
             }
 
-            //absolute placement: tiles butt against each other, skyline-style
-            e.setBounds(r.x, r.y, r.width, r.height);
-            gridTable.addChild(e);
-            maxW = Math.max(maxW, r.x + r.width);
-            maxH = Math.max(maxH, r.y + r.height);
+            for(TileEnt e : ents){
+                float w = e.w * cell - gap, h = e.h * cell - gap;
+                float x = e.gx * cell;
+                //top-down placement: row 0 is the topmost row; the scene uses y-up coordinates,
+                //so the top row has the highest y (older builds placed row 0 at the bottom, which
+                //made tiles dropped into empty space land below the visible area and vanish)
+                float y = maxH - (e.gy * cell + h);
+                Element el = e.fixedId != null ? addFixedTile(e.fixedId, e.source, w, h) : addUserTile(e.source, w, h);
+                el.setBounds(x, y, w, h);
+                gridTable.addChild(el);
+            }
+
+            //drive the pane content size through a transparent spacer so scrolling still works
+            Element spacer = new Element();
+            spacer.touchable = Touchable.disabled;
+            gridTable.add(spacer).size(maxW, maxH);
+            gridTable.setSize(maxW, maxH);
+            gridTable.validate();
+        }finally{
+            buildingGrid = false;
         }
-
-        //drive the pane content size through a transparent spacer so scrolling still works
-        Element spacer = new Element();
-        spacer.touchable = Touchable.disabled;
-        gridTable.add(spacer).size(maxW, maxH);
-        gridTable.setSize(maxW, maxH);
-        gridTable.validate();
-    }
-
-    /** The draggable placeholder entry backing a fixed tile. */
-    TileEntry holderFor(String id){
-        if(TILE_ALL.equals(id)) return fixedAll;
-        if(TILE_UNCAT.equals(id)) return fixedUncat;
-        return fixedNew;
     }
 
     Element addFixedTile(String id, TileEntry holder, float w, float h){
@@ -518,10 +506,10 @@ public class BetterSchematicsDialog extends SchematicsDialog{
                         n.center();
                         n.image(Icon.paste).size(64f);
                     }),
-                    nameBar(Core.bundle.get("better-blueprints.all"), w),
+                    nameBar(fixedName(id), w),
                     badge(schematics.all().size)
                 ).grow();
-            }, () -> enterTile(TILE_ALL), holder);
+            }, () -> enterTile(TILE_ALL), holder, id);
         }else if(TILE_UNCAT.equals(id)){
             return addTileWidget(w, h, b -> {
                 b.stack(
@@ -529,17 +517,17 @@ public class BetterSchematicsDialog extends SchematicsDialog{
                         n.center();
                         n.image(Icon.folder).size(64f);
                     }),
-                    nameBar(Core.bundle.get("better-blueprints.uncat"), w),
+                    nameBar(fixedName(id), w),
                     badge(countUncat())
                 ).grow();
-            }, () -> enterTile(TILE_UNCAT), holder);
+            }, () -> enterTile(TILE_UNCAT), holder, id);
         }else{
             return addTileWidget(w, h, b -> {
                 b.center();
                 b.image(Icon.add).size(48f);
                 b.row();
                 b.add("@better-blueprints.newtile").color(Color.lightGray).padTop(8f);
-            }, () -> showNewTile(s -> {}), holder);
+            }, () -> showNewTile(s -> {}), holder, id);
         }
     }
 
@@ -556,7 +544,7 @@ public class BetterSchematicsDialog extends SchematicsDialog{
                 badge(tile.count()),
                 pencil(tile)
             ).grow();
-        }, () -> enterTile(tile.id), tile);
+        }, () -> enterTile(tile.id), tile, null);
     }
 
     Table badge(int count){
@@ -652,40 +640,42 @@ public class BetterSchematicsDialog extends SchematicsDialog{
 
     /**
      * Creates one fixed-size tile widget (not added to any parent; the grid places it
-     * absolutely). User tiles ({@code dragSource != null}) get a drag listener: a pointer press
-     * records the drag start, the actual drag loop runs in the floating tile's per-frame update
-     * (robust against the scroll pane cancelling touch focus when it starts panning).
+     * absolutely). Every tile ({@code dragSource != null}, user or fixed) gets a drag listener:
+     * a pointer press records the drag start, the actual drag loop runs in the floating tile's
+     * per-frame update (robust against the scroll pane cancelling touch focus when it starts
+     * panning).
      */
-    Element addTileWidget(float w, float h, Cons<Table> content, Runnable click, TileEntry dragSource){
-        Button[] sel = {null};
+    Element addTileWidget(float w, float h, Cons<Table> content, Runnable click, TileEntry dragSource, String fixedId){
         Button button = new Button(Styles.flati);
+        //local style copy: never mutate the shared flati style
+        ButtonStyle style = new ButtonStyle(button.getStyle());
+        style.up = Tex.pane;
+        button.setStyle(style);
         button.top();
         button.margin(0f);
         content.get(button);
-        sel[0] = button;
         button.setSize(w, h);
 
         button.clicked(() -> {
-            if(sel[0].childrenPressed()) return;
+            if(button.childrenPressed()) return;
             if(dragActive) return; //a drag was in progress: release must not navigate
             click.run();
         });
-        button.getStyle().up = Tex.pane;
 
         if(dragSource != null){
             button.addListener(new InputListener(){
                 @Override
-                public boolean touchDown(InputEvent event, float x, float y, int pointer, KeyCode button){
+                public boolean touchDown(InputEvent event, float x, float y, int pointer, KeyCode code){
                     if(dragPointer != -1) return false;
-                    if(button != null && button != KeyCode.mouseLeft) return false;
+                    if(code != null && code != KeyCode.mouseLeft) return false;
                     //ignore presses starting on the pencil / badge area
-                    if(sel[0].childrenPressed()) return false;
-                    beginDrag(pointer, dragSource);
+                    if(button.childrenPressed()) return false;
+                    beginDrag(pointer, dragSource, fixedId);
                     return false;
                 }
 
                 @Override
-                public void touchUp(InputEvent event, float x, float y, int pointer, KeyCode button){
+                public void touchUp(InputEvent event, float x, float y, int pointer, KeyCode code){
                     if(pointer != dragPointer) return;
                     //scroll pane panning cancelled our focus: the real release is detected by polling
                     if(event.isTouchFocusCancel()) return;
@@ -700,26 +690,28 @@ public class BetterSchematicsDialog extends SchematicsDialog{
 
     //region tile drag & drop
 
-    void beginDrag(int pointer, TileEntry tile){
+    void beginDrag(int pointer, TileEntry tile, String fixedId){
         dragPointer = pointer;
         dragTile = tile;
+        dragFixedId = fixedId;
         dragActive = false;
         dragStartX = Core.input.mouseX(pointer);
         dragStartY = Core.input.mouseY(pointer);
 
-        //semi-transparent copy of the tile (cover + name bar) that follows the pointer; kept
-        //off-screen until the drag threshold is crossed. Its update() polls the input so the
-        //drag works even after the scroll pane steals touch focus.
+        //copy of the tile (cover + name bar) that follows the pointer; kept off-screen until the
+        //drag threshold is crossed. Its update() polls the input so the drag works even after the
+        //scroll pane steals touch focus.
+        float w = tile.w * cell - gap, h = tile.h * cell - gap;
         floatingTile = new Table();
         floatingTile.touchable = Touchable.disabled;
         floatingTile.top();
         floatingTile.margin(0f);
         floatingTile.setBackground(Tex.pane);
         floatingTile.stack(
-            coverElement(tile),
-            nameBar(tile.name, tile.w * cell - gap)
-        ).size(tile.w * cell - gap, tile.h * cell - gap);
-        floatingTile.setSize(tile.w * cell - gap, tile.h * cell - gap);
+            dragBody(tile, fixedId),
+            nameBar(dragName(), w)
+        ).size(w, h);
+        floatingTile.setSize(w, h);
         floatingTile.update(() -> updateDrag());
         floatingTile.setPosition(-10000f, -10000f);
         addChild(floatingTile);
@@ -747,7 +739,7 @@ public class BetterSchematicsDialog extends SchematicsDialog{
             if(dx * dx + dy * dy < dragThreshold * dragThreshold) return;
 
             dragActive = true;
-            //dominant drag direction decides how displaced tiles get shoved
+            //dominant drag direction decides how displaced tiles get shoved on drop
             dragDirX = Math.abs(dx) >= Math.abs(dy) ? Math.signum(dx) : 0f;
             dragDirY = Math.abs(dy) > Math.abs(dx) ? Math.signum(dy) : 0f;
             if(dragDirX == 0f && dragDirY == 0f) dragDirX = 1f;
@@ -755,8 +747,21 @@ public class BetterSchematicsDialog extends SchematicsDialog{
             dragGx = start[0];
             dragGy = start[1];
             if(tilePane != null) tilePane.setScrollingDisabled(true, true);
-            simulateMove();
-            buildGrid();
+
+            //target-cell white outline inside the grid; the grid itself never rebuilds while dragging
+            dragGhost = new Table(){
+                @Override
+                public void draw(){
+                    Draw.color(Color.white, 0.85f);
+                    Lines.stroke(Scl.scl(1.5f));
+                    Lines.rect(x, y, width, height);
+                    Draw.reset();
+                }
+            };
+            dragGhost.touchable = Touchable.disabled;
+            gridTable.addChild(dragGhost);
+            updateGhost();
+            Log.info("[BetterBlueprints] drag started: '@' target=(@,@)", dragName(), dragGx, dragGy);
         }
 
         //floating tile follows the pointer, centered on it, in dialog-local coordinates
@@ -764,121 +769,206 @@ public class BetterSchematicsDialog extends SchematicsDialog{
         stageToLocalCoordinates(tmp);
         floatingTile.setPosition(tmp.x - floatingTile.getWidth() / 2f, tmp.y - floatingTile.getHeight() / 2f);
 
+        //target cell follows the pointer; only the ghost moves, the grid layout stays untouched
         int[] target = computeDragTarget(mx, my);
         if(target[0] != dragGx || target[1] != dragGy){
             dragGx = target[0];
             dragGy = target[1];
-            simulateMove();
-            buildGrid();
+            updateGhost();
         }
     }
 
     /**
-     * Pointer to target grid cell: the dragged tile's top-left snaps so its center follows the
-     * pointer; the target is clamped inside the grid.
+     * Pointer to target grid cell: the dragged tile's center snaps to the pointer, clamped to
+     * the grid (horizontally to the visible columns, vertically to a sane row limit).
      */
     int[] computeDragTarget(float mx, float my){
         tmp.set(mx, my);
         gridTable.stageToLocalCoordinates(tmp);
-        float left = tmp.x - dragTile.w * unit / 2f;
-        float top = gridTable.getHeight() - tmp.y - dragTile.h * unit / 2f;
-        int tgx = Math.round(left / cell);
-        int tgy = Math.round(top / cell);
+        float contentH = gridTable.getHeight();
+        float wOff = (dragTile.w * cell - gap) / 2f;
+        float hOff = (dragTile.h * cell - gap) / 2f;
+        int tgx = Math.round((tmp.x - wOff) / cell);
+        int tgy = Math.round((contentH - tmp.y - hOff) / cell);
         tgx = Math.max(0, Math.min(tgx, Math.max(0, cols() - dragTile.w)));
-        tgy = Math.max(0, tgy);
+        tgy = Math.max(0, Math.min(tgy, maxRows));
         return new int[]{tgx, tgy};
     }
 
-    /**
-     * Simulates the grid state while dragging: the dragged tile is placed at its target cell and
-     * every tile it overlaps is moved to the nearest free cell along the drag direction. Only
-     * directly displaced tiles move (no cascading rows); results go into {@link #dragPreview}
-     * (stored positions are untouched until the drop).
-     */
-    void simulateMove(){
-        dragPreview.clear();
-        Seq<TileEntry> all = new Seq<>(store.data.tiles);
-        all.add(fixedAll);
-        all.add(fixedUncat);
-        all.add(fixedNew);
-        for(TileEntry t : all){
-            dragPreview.put(t, new int[]{t.gx, t.gy});
-        }
-        int[] dp = dragPreview.get(dragTile);
-        dp[0] = dragGx;
-        dp[1] = dragGy;
-
-        //only tiles overlapped by the dragged tile move; each goes to the nearest free cell
-        for(TileEntry t : all){
-            if(t == dragTile) continue;
-            int[] pt = dragPreview.get(t);
-            if(!overlap(dp[0], dp[1], dragTile.w, dragTile.h, pt[0], pt[1], t.w, t.h)) continue;
-
-            int[] slot = findFreeSlot(t, pt[0], pt[1], dragDirX, dragDirY);
-            if(slot != null){
-                pt[0] = slot[0];
-                pt[1] = slot[1];
-            }
-        }
+    /** Moves the target-cell outline to the current drag cell. Top-down placement means a cell
+     * below the current content has a negative y and shows in the empty pane area. */
+    void updateGhost(){
+        if(dragGhost == null) return;
+        float contentH = gridTable.getHeight();
+        dragGhost.setBounds(
+            dragGx * cell,
+            contentH - (dragGy * cell + dragTile.h * cell - gap),
+            dragTile.w * cell - gap,
+            dragTile.h * cell - gap
+        );
     }
 
-    /** Nearest cell along the drag direction that fits this tile without overlapping any preview tile. */
-    int[] findFreeSlot(TileEntry t, int gx, int gy, float dirX, float dirY){
-        for(int i = 1; i <= 32; i++){
-            int nx = gx + Math.round(dirX * i);
-            int ny = gy + Math.round(dirY * i);
-            if(dirX != 0f) nx = Math.max(0, Math.min(nx, Math.max(0, cols() - t.w)));
-            ny = Math.max(0, ny);
-            if(!overlapsInPreview(t, nx, ny)) return new int[]{nx, ny};
+    /**
+     * Applies the drop. Displacement rule (single, deterministic definition):
+     * <ol>
+     * <li>if the dragged tile covers another tile, the two <b>swap</b> cells (the covered tile
+     *     moves to the dragged tile's old cell, the dragged tile takes the target cell);</li>
+     * <li>tiles that still overlap after the swap (larger tiles covering several others, or a
+     *     swap partner that does not fit the old cell) are pushed one cell at a time along the
+     *     dominant drag direction, shoving any tile in their way (chain push);</li>
+     * <li>if the chain is blocked, the same push is tried straight down;</li>
+     * <li>as a last resort the tile is appended below everything, leftmost first.</li>
+     * </ol>
+     * The result never contains overlaps. Persisted positions are updated via
+     * {@link #writeBack(TileEnt)}; returns whether anything changed.
+     */
+    boolean resolveDrop(Seq<TileEnt> ents, TileEnt dragged, int tgx, int tgy, float dirX, float dirY, int ncols){
+        ObjectMap<TileEntry, int[]> pos = new ObjectMap<>();
+        for(TileEnt e : ents) pos.put(e.source, new int[]{e.gx, e.gy});
+        int[] dp = pos.get(dragged.source);
+        int[] from = {dp[0], dp[1]};
+        dp[0] = tgx;
+        dp[1] = tgy;
+
+        //swap rule: the first tile covered by the dragged tile exchanges cells with it
+        for(TileEnt e : ents){
+            if(e == dragged) continue;
+            int[] p = pos.get(e.source);
+            if(overlap(dp[0], dp[1], dragged.w, dragged.h, p[0], p[1], e.w, e.h)){
+                p[0] = from[0];
+                p[1] = from[1];
+                Log.info("[BetterBlueprints] swap '@' (@,@) <-> '@' (@,@)", dragged.source.name, from[0], from[1], e.source.name, tgx, tgy);
+                break;
+            }
+        }
+
+        //resolve any remaining overlaps with the push rules; the append fallback guarantees termination
+        for(int pass = 0; pass < ents.size + 2; pass++){
+            boolean any = false;
+            for(TileEnt e : ents){
+                if(e == dragged) continue;
+                int[] p = pos.get(e.source);
+                if(!overlapsAny(ents, pos, e)) continue;
+                any = true;
+                ObjectSet<TileEntry> visited = new ObjectSet<>();
+                int[] moved = pushChain(ents, pos, e, p, dirX, dirY, visited, dragged.source, ncols);
+                if(moved == null) moved = pushChain(ents, pos, e, p, 0f, 1f, visited, dragged.source, ncols);
+                if(moved == null) moved = appendBottom(ents, pos, e, ncols);
+                p[0] = moved[0];
+                p[1] = moved[1];
+            }
+            if(!any) break;
+        }
+
+        boolean changed = false;
+        for(TileEnt e : ents){
+            int[] p = pos.get(e.source);
+            if(p[0] != e.gx || p[1] != e.gy){
+                e.gx = p[0];
+                e.gy = p[1];
+                writeBack(e);
+                changed = true;
+            }else{
+                e.gx = p[0];
+                e.gy = p[1];
+            }
+        }
+        return changed;
+    }
+
+    /** Recursively pushes {@code e} one cell along the direction, shoving blockers in turn.
+     * Returns the pushed tile's new cell, or null when the chain is blocked (visited / edge). */
+    static int[] pushChain(Seq<TileEnt> ents, ObjectMap<TileEntry, int[]> pos, TileEnt e, int[] cur,
+                           float dirX, float dirY, ObjectSet<TileEntry> visited, TileEntry dragged, int ncols){
+        if(visited.contains(e.source)) return null;
+        visited.add(e.source);
+
+        int nx = cur[0] + Math.round(dirX), ny = cur[1] + Math.round(dirY);
+        if(dirX != 0) nx = Math.max(0, Math.min(nx, Math.max(0, ncols - e.w)));
+        ny = Math.max(0, ny);
+        if(nx == cur[0] && ny == cur[1]) return null; //at the edge: cannot move along this direction
+
+        TileEntry blocker = occupantAt(ents, pos, nx, ny, e.w, e.h, e.source);
+        if(blocker == null) return new int[]{nx, ny};
+        if(blocker == dragged || visited.contains(blocker)) return null;
+
+        TileEnt be = entFor(ents, blocker);
+        int[] bmoved = pushChain(ents, pos, be, pos.get(blocker), dirX, dirY, visited, dragged, ncols);
+        if(bmoved == null) return null;
+        pos.put(blocker, bmoved);
+        return new int[]{nx, ny};
+    }
+
+    /** First entity (other than self) whose rect overlaps the given cell, or null. */
+    static TileEntry occupantAt(Seq<TileEnt> ents, ObjectMap<TileEntry, int[]> pos, int gx, int gy, int w, int h, TileEntry self){
+        for(TileEnt e : ents){
+            if(e.source == self) continue;
+            int[] p = pos.get(e.source);
+            if(overlap(gx, gy, w, h, p[0], p[1], e.w, e.h)) return e.source;
         }
         return null;
     }
 
-    boolean overlapsInPreview(TileEntry self, int gx, int gy){
-        for(ObjectMap.Entry<TileEntry, int[]> e : dragPreview){
-            if(e.key == self) continue;
-            int[] p = e.value;
-            if(overlap(gx, gy, self.w, self.h, p[0], p[1], e.key.w, e.key.h)) return true;
+    /** Whether {@code e} overlaps any other entity in the position map. */
+    static boolean overlapsAny(Seq<TileEnt> ents, ObjectMap<TileEntry, int[]> pos, TileEnt e){
+        int[] p = pos.get(e.source);
+        for(TileEnt o : ents){
+            if(o.source == e.source) continue;
+            int[] q = pos.get(o.source);
+            if(overlap(p[0], p[1], e.w, e.h, q[0], q[1], o.w, o.h)) return true;
         }
         return false;
     }
 
-    /** Finishes the drag: applies the simulated positions, restores scrolling, rebuilds. */
-    void endDrag(){
-        if(dragPointer < 0) return;
-
-        if(dragActive){
-            boolean changed = false;
-            for(TileEntry t : store.data.tiles){
-                int[] p = dragPreview.get(t);
-                if(p != null && (p[0] != t.gx || p[1] != t.gy)){
-                    t.gx = p[0];
-                    t.gy = p[1];
-                    changed = true;
+    /** Leftmost cell below everything that fits this tile (always succeeds). */
+    static int[] appendBottom(Seq<TileEnt> ents, ObjectMap<TileEntry, int[]> pos, TileEnt e, int ncols){
+        int maxRow = 0;
+        for(TileEnt o : ents){
+            int[] p = pos.get(o.source);
+            maxRow = Math.max(maxRow, p[1] + o.h);
+        }
+        int maxX = Math.max(ncols, e.w);
+        for(int row = maxRow; row < maxRow + 128; row++){
+            for(int x = 0; x <= Math.max(0, maxX - e.w); x++){
+                if(occupantAt(ents, pos, x, row, e.w, e.h, e.source) == null){
+                    return new int[]{x, row};
                 }
             }
-            int[] pa = dragPreview.get(fixedAll);
-            if(pa != null && (pa[0] != store.data.allGx || pa[1] != store.data.allGy)){
-                store.data.allGx = pa[0];
-                store.data.allGy = pa[1];
-                changed = true;
-            }
-            int[] pu = dragPreview.get(fixedUncat);
-            if(pu != null && (pu[0] != store.data.uncatGx || pu[1] != store.data.uncatGy)){
-                store.data.uncatGx = pu[0];
-                store.data.uncatGy = pu[1];
-                changed = true;
-            }
-            int[] pn = dragPreview.get(fixedNew);
-            if(pn != null && (pn[0] != store.data.newGx || pn[1] != store.data.newGy)){
-                store.data.newGx = pn[0];
-                store.data.newGy = pn[1];
-                changed = true;
-            }
-            if(changed) store.save();
-            if(tilePane != null) tilePane.setScrollingDisabled(false, false);
-            dragActive = false;
         }
+        return new int[]{0, maxRow}; //unreachable in practice
+    }
+
+    static TileEnt entFor(Seq<TileEnt> ents, TileEntry source){
+        for(TileEnt e : ents){
+            if(e.source == source) return e;
+        }
+        return null;
+    }
+
+    /** Finishes the drag: resolves the final layout once, persists, restores scrolling, rebuilds. */
+    void endDrag(){
+        if(dragPointer < 0) return;
+        if(!dragActive){
+            cancelDrag();
+            return;
+        }
+
+        Seq<TileEnt> ents = buildEntities();
+        TileEnt draggedEnt = entFor(ents, dragTile);
+        if(draggedEnt != null){
+            boolean changed = resolveDrop(ents, draggedEnt, dragGx, dragGy, dragDirX, dragDirY, cols());
+            if(changed) store.save();
+            Log.info("[BetterBlueprints] drop '@' -> (@,@) changed=@", dragName(), dragGx, dragGy, changed);
+
+            //scroll the dropped tile into view when it landed below the current viewport
+            float bottom = (dragGy + dragTile.h) * cell - gap;
+            float vh = tilePane != null ? tilePane.getHeight() : 0f;
+            pendingScrollY = (vh > 0 && bottom > vh) ? bottom - vh + Scl.scl(16f) : -1;
+        }else{
+            pendingScrollY = -1;
+        }
+
+        if(tilePane != null) tilePane.setScrollingDisabled(false, false);
         cancelDrag();
         rebuildView();
     }
@@ -888,13 +978,38 @@ public class BetterSchematicsDialog extends SchematicsDialog{
         dragPointer = -1;
         dragActive = false;
         dragTile = null;
+        dragFixedId = null;
         dragGx = 0;
         dragGy = 0;
-        dragPreview.clear();
         if(floatingTile != null){
             floatingTile.remove();
             floatingTile = null;
         }
+        if(dragGhost != null){
+            dragGhost.remove();
+            dragGhost = null;
+        }
+    }
+
+    /** Body of the floating drag copy: fixed tiles show their icon, user tiles their cover. */
+    Element dragBody(TileEntry tile, String fixedId){
+        if(fixedId != null){
+            Table t = new Table();
+            t.center();
+            t.image(TILE_ALL.equals(fixedId) ? Icon.paste : TILE_UNCAT.equals(fixedId) ? Icon.folder : Icon.add).size(64f);
+            return t;
+        }
+        return coverElement(tile);
+    }
+
+    String dragName(){
+        return dragFixedId != null ? fixedName(dragFixedId) : (dragTile != null ? dragTile.name : "");
+    }
+
+    String fixedName(String id){
+        if(TILE_ALL.equals(id)) return Core.bundle.get("better-blueprints.all");
+        if(TILE_UNCAT.equals(id)) return Core.bundle.get("better-blueprints.uncat");
+        return Core.bundle.get("better-blueprints.newtile");
     }
 
     //endregion

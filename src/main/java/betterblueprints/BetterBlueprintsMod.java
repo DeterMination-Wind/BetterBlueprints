@@ -37,17 +37,6 @@ public class BetterBlueprintsMod extends Mod{
                 Timer.schedule(this::replace, delay);
             }
         });
-
-        //TEMP SMOKE-TEST HOOK: auto-open the blueprint browser for screenshot verification.
-        Events.on(ClientLoadEvent.class, event -> {
-            for(float delay : new float[]{8f, 16f}){
-                Timer.schedule(() -> {
-                    if(ui != null && ui.schematics != null && ui.schematics instanceof BetterSchematicsDialog){
-                        ui.schematics.show();
-                    }
-                }, delay);
-            }
-        });
     }
 
     private void replace(){
