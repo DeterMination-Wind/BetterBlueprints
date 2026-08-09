@@ -9,6 +9,12 @@ public class BlueprintsData{
     public boolean migrated;
     /** User-defined tiles, in display order. */
     public Seq<TileEntry> tiles = new Seq<>();
+    /** Grid cells of the fixed "All" tile; -1 = auto (0,0). */
+    public int allGx = -1, allGy = -1;
+    /** Grid cells of the fixed "Uncategorized" tile; -1 = auto place. */
+    public int uncatGx = -1, uncatGy = -1;
+    /** Grid cells of the fixed "new tile" button; -1 = auto place. */
+    public int newGx = -1, newGy = -1;
 
     public static class TileEntry{
         /** Stable id used to reference this tile. */
