@@ -1,5 +1,7 @@
 # BetterBlueprints / 更好的蓝图
 
+> [NOTE] 若有反馈，请发送反馈到bugsoc@qq.com / If you have any feedback, please send it to bugsoc@qq.com
+
 Mindustry mod that turns the blueprint browser into a Windows-10-style tile grid: fixed "All",
 "Uncategorized" and "+" tiles plus user tiles of configurable size with cover previews. Tiles can
 be dragged to any grid cell to rearrange the layout; clicking a tile shows its schematics, with a
